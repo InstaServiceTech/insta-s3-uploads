@@ -1,0 +1,112 @@
+name: Upload images to S3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "images/**"
+      - ".github/workflows/upload-to-s3.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload new files to S3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload only new or changed files
+        env:
+          BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BUCKET}" ]; then
+            echo "AWS_S3_BUCKET secret is not set"
+            exit 1
+          fi
+
+          list_new_files() {
+            if [ "${EVENT_NAME}" = "push" ] && [ -n "${BEFORE:-}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+              git diff --name-only --diff-filter=AM "${BEFORE}" "${SHA}" -- images/ || true
+            elif [ "${EVENT_NAME}" = "push" ]; then
+              find images -type f ! -name '.gitkeep'
+            else
+              find images -type f ! -name '.gitkeep'
+            fi
+          }
+
+          echo "## Asset URLs" >> "${GITHUB_STEP_SUMMARY}"
+          echo >> "${GITHUB_STEP_SUMMARY}"
+
+          found=0
+          conflicts=0
+          declare -A seen_keys
+
+          while IFS= read -r file; do
+            [ -z "${file}" ] && continue
+            case "${file}" in
+              *.gitkeep) continue ;;
+            esac
+            [ -f "${file}" ] || continue
+
+            rel="${file#images/}"
+            key="${rel// /-}"
+
+            if [ -n "${seen_keys[${key}]:-}" ]; then
+              echo "::error::Duplicate name in this upload: ${key}. Change the image name and upload again."
+              echo "Duplicate name in this upload: ${key}. Change the image name and upload again."
+              conflicts=1
+              continue
+            fi
+            seen_keys["${key}"]=1
+
+            if aws s3api head-object --bucket "${BUCKET}" --key "${key}" >/dev/null 2>&1; then
+              echo "::error::File already exists in S3: ${key}. Change the image name and upload again."
+              echo "File already exists in S3: ${key}. Change the image name and upload again."
+              echo "- **${key}** already exists. Change the image name and upload again." >> "${GITHUB_STEP_SUMMARY}"
+              conflicts=1
+              continue
+            fi
+
+            if [ "${rel}" != "${key}" ]; then
+              echo "Uploading ${rel} as ${key}"
+            else
+              echo "Uploading ${key}"
+            fi
+            aws s3 cp "${file}" "s3://${BUCKET}/${key}"
+
+            url="https://assets.instaservice.com/${key}"
+            echo "${url}"
+            echo "::notice::${url}"
+            echo "- [${key}](${url})" >> "${GITHUB_STEP_SUMMARY}"
+            found=1
+          done < <(list_new_files)
+
+          if [ "${conflicts}" -ne 0 ]; then
+            echo "Upload failed: a file with this name already exists in S3. Change the image name and upload again."
+            echo >> "${GITHUB_STEP_SUMMARY}"
+            echo "_Upload failed. Change the image name and upload again._" >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          if [ "${found}" -eq 0 ]; then
+            echo "No new files to upload"
+            echo "_No new files uploaded in this run._" >> "${GITHUB_STEP_SUMMARY}"
+          fi
